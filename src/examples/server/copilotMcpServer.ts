@@ -16,7 +16,7 @@ import { McpServer, ResourceTemplate } from '../../server/mcp.js';
 import { StdioServerTransport } from '../../server/stdio.js';
 import { CallToolResult } from '../../types.js';
 import { appendFile, mkdir } from 'fs/promises';
-import { existsSync, readFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync, chmodSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 
@@ -24,6 +24,39 @@ const COPILOT_COMMAND = 'copilot';
 const DEFAULT_TIMEOUT_MS = 60000;
 const HELP_TIMEOUT_MS = 5000;
 const DEFAULT_MAX_PROMPT_BYTES = 24000;
+
+// Track temp dirs created for MCP config injection so we can clean up on exit
+const mcpTmpDirs = new Set<string>();
+const cleanupMcpTmpDirs = (): void => {
+    for (const dir of mcpTmpDirs) {
+        try { rmSync(dir, { recursive: true, force: true }); } catch (_) {}
+    }
+    mcpTmpDirs.clear();
+};
+process.on('exit', cleanupMcpTmpDirs);
+process.on('SIGINT', () => { cleanupMcpTmpDirs(); process.exit(130); });
+process.on('SIGTERM', () => { cleanupMcpTmpDirs(); process.exit(143); });
+
+// Cache MCP config at startup to avoid repeated synchronous disk I/O per call
+let cachedMcpConfigDir: string | undefined;
+const initMcpConfigDir = (): void => {
+    const mcpConfigPath = process.env.COPILOT_MCP_CONFIG_PATH?.trim()
+        || join(homedir(), '.copilot', 'mcp-config.json');
+    try {
+        const mcpConfig = readFileSync(mcpConfigPath, 'utf-8');
+        const tmpDir = mkdtempSync(join(homedir(), '.copilot', 'mcp-tmp-'));
+        chmodSync(tmpDir, 0o700);
+        writeFileSync(join(tmpDir, 'mcp-config.json'), mcpConfig, { mode: 0o600 });
+        mcpTmpDirs.add(tmpDir);
+        cachedMcpConfigDir = tmpDir;
+        logMessage('debug', 'MCP config loaded', { path: mcpConfigPath, tmpDir });
+    } catch (e) {
+        logMessage('debug', 'No MCP config found or failed to load', {
+            path: mcpConfigPath,
+            error: (e as Error).message
+        });
+    }
+};
 const FALLBACK_MODELS = [
     'claude-sonnet-4.5',
     'claude-haiku-4.5',
@@ -365,15 +398,6 @@ async function executeCopilotCommand(
         additionalArgs?: string[];
     } = {}
 ): Promise<CopilotCommandResult> {
-    // Read MCP config before the Promise — await is not valid inside a Promise callback.
-    // Path defaults to ~/.copilot/mcp-config.json, override with COPILOT_MCP_CONFIG_PATH.
-    let mcpConfig: string | undefined;
-    const mcpConfigPath = process.env.COPILOT_MCP_CONFIG_PATH?.trim()
-        || join(homedir(), '.copilot', 'mcp-config.json');
-    try {
-        mcpConfig = readFileSync(mcpConfigPath, 'utf-8').trim();
-    } catch (e) { /* no mcp config found, skip */ }
-
     return new Promise((resolve, reject) => {
         const fullPrompt = options.context ? `${prompt}\n\nContext:\n${options.context}` : prompt;
         const selectedModel = options.model ?? getDefaultModel();
@@ -419,12 +443,11 @@ async function executeCopilotCommand(
             args.push(...options.additionalArgs);
         }
 
-        // Inject user MCP config so subprocess has access to all registered MCP tools.
-        // COPILOT_MCP_CONFIG_PATH overrides the default ~/.copilot/mcp-config.json path.
-        // Note: requires shell: false (default in this file) — shell: true would cause
-        // the JSON to be interpreted by /bin/sh, breaking the argument entirely.
-        if (mcpConfig) {
-            args.push('--additional-mcp-config', mcpConfig);
+        // Inject user MCP config via a secure temp dir (chmod 700/600).
+        // Using --config-dir avoids exposing secrets in argv (visible via ps/Task Manager).
+        // The temp dir is created once at startup and cleaned up on process exit.
+        if (cachedMcpConfigDir) {
+            args.push('--config-dir', cachedMcpConfigDir);
         }
 
         const child = spawn(COPILOT_COMMAND, args, {
@@ -1050,6 +1073,9 @@ async function main() {
 
     // Initialize directories
     await initDirectories();
+
+    // Load MCP config into a secure temp dir for subprocess injection
+    initMcpConfigDir();
 
     // Create initial session
     createSession();

@@ -16,7 +16,7 @@ import { McpServer, ResourceTemplate } from '../../server/mcp.js';
 import { StdioServerTransport } from '../../server/stdio.js';
 import { CallToolResult } from '../../types.js';
 import { appendFile, mkdir } from 'fs/promises';
-import { existsSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 
@@ -365,6 +365,15 @@ async function executeCopilotCommand(
         additionalArgs?: string[];
     } = {}
 ): Promise<CopilotCommandResult> {
+    // Read MCP config before the Promise — await is not valid inside a Promise callback.
+    // Path defaults to ~/.copilot/mcp-config.json, override with COPILOT_MCP_CONFIG_PATH.
+    let mcpConfig: string | undefined;
+    const mcpConfigPath = process.env.COPILOT_MCP_CONFIG_PATH?.trim()
+        || join(homedir(), '.copilot', 'mcp-config.json');
+    try {
+        mcpConfig = readFileSync(mcpConfigPath, 'utf-8').trim();
+    } catch (e) { /* no mcp config found, skip */ }
+
     return new Promise((resolve, reject) => {
         const fullPrompt = options.context ? `${prompt}\n\nContext:\n${options.context}` : prompt;
         const selectedModel = options.model ?? getDefaultModel();
@@ -408,6 +417,14 @@ async function executeCopilotCommand(
         // Add additional arguments
         if (options.additionalArgs) {
             args.push(...options.additionalArgs);
+        }
+
+        // Inject user MCP config so subprocess has access to all registered MCP tools.
+        // COPILOT_MCP_CONFIG_PATH overrides the default ~/.copilot/mcp-config.json path.
+        // Note: requires shell: false (default in this file) — shell: true would cause
+        // the JSON to be interpreted by /bin/sh, breaking the argument entirely.
+        if (mcpConfig) {
+            args.push('--additional-mcp-config', mcpConfig);
         }
 
         const child = spawn(COPILOT_COMMAND, args, {

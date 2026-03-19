@@ -43,13 +43,39 @@ const initMcpConfigDir = (): void => {
     const mcpConfigPath = process.env.COPILOT_MCP_CONFIG_PATH?.trim()
         || join(homedir(), '.copilot', 'mcp-config.json');
     try {
-        const mcpConfig = readFileSync(mcpConfigPath, 'utf-8');
+        const raw = JSON.parse(readFileSync(mcpConfigPath, 'utf-8')) as {
+            mcpServers: Record<string, unknown>;
+        };
+
+        // Filter servers: COPILOT_MCP_INCLUDE_SERVERS (whitelist) takes priority,
+        // then COPILOT_MCP_EXCLUDE_SERVERS (blacklist), then inject all if neither set.
+        const includeEnv = process.env.COPILOT_MCP_INCLUDE_SERVERS?.trim();
+        const excludeEnv = process.env.COPILOT_MCP_EXCLUDE_SERVERS?.trim();
+        let servers = raw.mcpServers ?? {};
+
+        if (includeEnv) {
+            const include = new Set(includeEnv.split(',').map(s => s.trim()));
+            servers = Object.fromEntries(
+                Object.entries(servers).filter(([k]) => include.has(k))
+            );
+        } else if (excludeEnv) {
+            const exclude = new Set(excludeEnv.split(',').map(s => s.trim()));
+            servers = Object.fromEntries(
+                Object.entries(servers).filter(([k]) => !exclude.has(k))
+            );
+        }
+
+        const filtered = JSON.stringify({ mcpServers: servers });
         const tmpDir = mkdtempSync(join(homedir(), '.copilot', 'mcp-tmp-'));
         chmodSync(tmpDir, 0o700);
-        writeFileSync(join(tmpDir, 'mcp-config.json'), mcpConfig, { mode: 0o600 });
+        writeFileSync(join(tmpDir, 'mcp-config.json'), filtered, { mode: 0o600 });
         mcpTmpDirs.add(tmpDir);
         cachedMcpConfigDir = tmpDir;
-        logMessage('debug', 'MCP config loaded', { path: mcpConfigPath, tmpDir });
+        logMessage('debug', 'MCP config loaded', {
+            path: mcpConfigPath,
+            tmpDir,
+            servers: Object.keys(servers)
+        });
     } catch (e) {
         logMessage('debug', 'No MCP config found or failed to load', {
             path: mcpConfigPath,

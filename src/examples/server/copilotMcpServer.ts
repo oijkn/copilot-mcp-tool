@@ -39,6 +39,9 @@ process.on('SIGTERM', () => { cleanupMcpTmpDirs(); process.exit(143); });
 
 // Cache MCP config at startup to avoid repeated synchronous disk I/O per call
 let cachedMcpConfigDir: string | undefined;
+// Servers to disable via --disable-mcp-server (those filtered out from the default config)
+let cachedDisabledServers: string[] = [];
+
 const initMcpConfigDir = (): void => {
     const mcpConfigPath = process.env.COPILOT_MCP_CONFIG_PATH?.trim()
         || join(homedir(), '.copilot', 'mcp-config.json');
@@ -51,19 +54,26 @@ const initMcpConfigDir = (): void => {
         // then COPILOT_MCP_EXCLUDE_SERVERS (blacklist), then inject all if neither set.
         const includeEnv = process.env.COPILOT_MCP_INCLUDE_SERVERS?.trim();
         const excludeEnv = process.env.COPILOT_MCP_EXCLUDE_SERVERS?.trim();
-        let servers = raw.mcpServers ?? {};
+        const allServers = raw.mcpServers ?? {};
+        let servers = allServers;
 
         if (includeEnv) {
             const include = new Set(includeEnv.split(',').map(s => s.trim()));
             servers = Object.fromEntries(
-                Object.entries(servers).filter(([k]) => include.has(k))
+                Object.entries(allServers).filter(([k]) => include.has(k))
             );
         } else if (excludeEnv) {
             const exclude = new Set(excludeEnv.split(',').map(s => s.trim()));
             servers = Object.fromEntries(
-                Object.entries(servers).filter(([k]) => !exclude.has(k))
+                Object.entries(allServers).filter(([k]) => !exclude.has(k))
             );
         }
+
+        // Build the list of servers to explicitly disable via --disable-mcp-server.
+        // The copilot CLI loads BOTH ~/.copilot/mcp-config.json and --config-dir/mcp-config.json,
+        // so filtered-out servers must also be disabled via this flag.
+        const allowedKeys = new Set(Object.keys(servers));
+        cachedDisabledServers = Object.keys(allServers).filter(k => !allowedKeys.has(k));
 
         const filtered = JSON.stringify({ mcpServers: servers });
         const tmpDir = mkdtempSync(join(homedir(), '.copilot', 'mcp-tmp-'));
@@ -74,7 +84,8 @@ const initMcpConfigDir = (): void => {
         logMessage('debug', 'MCP config loaded', {
             path: mcpConfigPath,
             tmpDir,
-            servers: Object.keys(servers)
+            servers: Object.keys(servers),
+            disabled: cachedDisabledServers
         });
     } catch (e) {
         logMessage('debug', 'No MCP config found or failed to load', {
@@ -474,6 +485,13 @@ async function executeCopilotCommand(
         // The temp dir is created once at startup and cleaned up on process exit.
         if (cachedMcpConfigDir) {
             args.push('--config-dir', cachedMcpConfigDir);
+        }
+
+        // Explicitly disable servers that were filtered out from the default config.
+        // The copilot CLI loads BOTH ~/.copilot/mcp-config.json and --config-dir/mcp-config.json,
+        // so filtered-out servers must also be disabled to prevent invalid schemas reaching the API.
+        for (const name of cachedDisabledServers) {
+            args.push('--disable-mcp-server', name);
         }
 
         const child = spawn(COPILOT_COMMAND, args, {
